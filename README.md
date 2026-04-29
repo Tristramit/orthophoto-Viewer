@@ -5,6 +5,8 @@ A lightweight viewer for large GeoTIFF and JP2 orthophotos. No GIS software requ
 - **Desktop mode** — pan, zoom, measure distances and areas
 - **Web mode** — tile server + Leaflet.js browser interface
 
+![Ortho Viewer Desktop Application](Screenshot_3.png)
+
 ---
 
 ## Download & Run (no installation needed)
