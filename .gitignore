@@ -35,5 +35,5 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Local config
-.claude/settings.local.json
+# Claude Code
+.claude/
