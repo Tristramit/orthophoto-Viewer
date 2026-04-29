@@ -1,0 +1,47 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: "3.11"
+          channels: conda-forge,defaults
+          channel-priority: strict
+          activate-environment: orthoviewer
+          auto-activate-base: false
+
+      - name: Install conda dependencies
+        shell: bash -el {0}
+        run: conda install -y gdal pyproj numpy
+
+      - name: Install pip dependencies
+        shell: bash -el {0}
+        run: pip install PyQt6 fastapi "uvicorn[standard]" pillow pyinstaller
+
+      - name: Build with PyInstaller
+        shell: bash -el {0}
+        run: pyinstaller ortho_viewer.spec
+
+      - name: Zip release bundle
+        shell: pwsh
+        run: Compress-Archive -Path dist/OrthoViewer -DestinationPath OrthoViewer-windows.zip
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: OrthoViewer-windows.zip
+          generate_release_notes: true

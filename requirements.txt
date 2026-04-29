@@ -1,0 +1,29 @@
+# Ortho Viewer dependencies
+#
+# ── Desktop app ──────────────────────────────────────────────────────────────
+# ── Web server ───────────────────────────────────────────────────────────────
+# pip install fastapi "uvicorn[standard]" pillow
+#   fastapi      — async web framework
+#   uvicorn      — ASGI server
+#   pillow       — PNG encoding for tile responses (optional, falls back to PyQt6)
+#
+# ── Both modes ───────────────────────────────────────────────────────────────
+#
+# Recommended install order (conda preferred for GDAL + pyproj):
+#
+#   conda create -n orthoviewer python=3.11
+#   conda activate orthoviewer
+#   conda install -c conda-forge gdal pyproj numpy
+#   pip install PyQt6
+#
+# Or with pip only (GDAL wheels may not include JP2 support on all platforms):
+#   pip install PyQt6 numpy pyproj gdal   # or use python-gdal from osgeo-utils
+
+PyQt6>=6.4.0
+numpy>=1.23.0
+pyproj>=3.4.0
+# GDAL: install via conda-forge or system package; avoid bare 'pip install gdal'
+# on Windows, use OSGeo4W or conda-forge:
+#   conda install -c conda-forge gdal
+# On Linux:
+#   sudo apt install python3-gdal   OR   conda install -c conda-forge gdal
