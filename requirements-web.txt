@@ -1,0 +1,11 @@
+# Ortho Viewer — web server only (used by the Docker image)
+#
+# GDAL itself is provided by the base image / system install; this just
+# pins the matching Python bindings + the web stack. No PyQt6 needed here.
+
+numpy>=1.23.0
+pyproj>=3.4.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pillow>=10.0.0
+python-multipart>=0.0.9

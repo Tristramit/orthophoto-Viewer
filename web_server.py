@@ -2,35 +2,50 @@
 """
 Ortho Viewer — Web Server Mode
 ===============================
-Serves the orthophoto as a tile map in the browser via FastAPI + Leaflet.
+Serves orthophotos as tile maps in the browser via FastAPI + Leaflet, and
+lets you upload new files through a password-protected admin page. Each
+uploaded file gets its own shareable/embeddable viewer URL.
 
 Architecture:
   - FastAPI backend:
-      GET /api/metadata        → raster info (CRS, bbox, levels)
-      GET /tiles/{z}/{x}/{y}   → PNG tile (TMS-like, image-space coords)
-      GET /                    → HTML page with Leaflet viewer
+      GET  /api/metadata?file=NAME      → raster info (CRS, bbox, levels)
+      GET  /tiles/{file}/{z}/{x}/{y}    → PNG tile (TMS-like, image-space coords)
+      POST /api/measure                 → distance/area measurement
+      GET  /view?file=NAME              → HTML page with Leaflet viewer (embeddable)
+      GET  /admin                       → upload form + file list (HTTP Basic auth)
+      POST /admin/upload                → upload a new raster (HTTP Basic auth)
+      DELETE /admin/files/{file}        → remove a raster (HTTP Basic auth)
   - Leaflet frontend:
-      Custom TileLayer that calls /tiles/{z}/{x}/{y}
+      Custom TileLayer that calls /tiles/{file}/{z}/{x}/{y}
       Coordinate display, distance & area measurement (Leaflet.draw)
       Dark theme to match desktop app
 
 Usage:
-    # Run with a specific file:
+    # Start the server (serves files from --data-dir, default ./data):
+    python web_server.py --host 0.0.0.0 --port 8765
+
+    # Optionally seed the data dir with a file at startup:
     python web_server.py path/to/file.tif
 
-    # Or start server and open the file browser:
-    python web_server.py
+    Then open:        http://localhost:8765/admin   (upload files, get embed links)
+    Embed a file at:  http://localhost:8765/view?file=NAME
 
-    Then open:  http://localhost:8765
+Admin credentials come from the ADMIN_USER / ADMIN_PASSWORD environment
+variables. If ADMIN_PASSWORD is not set, a random password is generated and
+printed once at startup.
 """
 
 from __future__ import annotations
 import io
 import math
 import os
+import secrets
+import shutil
 import sys
 import threading
 import logging
+from collections import OrderedDict
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -39,8 +54,9 @@ import numpy as np
 # Attempt to import optional web deps — give a clear error if missing
 # ---------------------------------------------------------------------------
 try:
-    from fastapi import FastAPI, HTTPException, Query
-    from fastapi.responses import HTMLResponse, Response, JSONResponse
+    from fastapi import FastAPI, HTTPException, Query, Depends, UploadFile, File
+    from fastapi.responses import HTMLResponse, Response, JSONResponse, RedirectResponse
+    from fastapi.security import HTTPBasic, HTTPBasicCredentials
     import uvicorn
     _WEB_DEPS_OK = True
 except ImportError:
@@ -59,36 +75,169 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ortho-web")
 
 # ---------------------------------------------------------------------------
-# Tile server
+# Config
 # ---------------------------------------------------------------------------
 
 WEB_TILE_SIZE = 256   # standard web map tile size
+MAX_OPEN_RASTERS = int(os.environ.get("ORTHO_MAX_OPEN", "4"))  # cached loaders
+ALLOWED_EXTENSIONS = {".tif", ".tiff", ".jp2"}
 
-_loader: Optional[RasterLoader] = None
+DATA_DIR = Path(os.environ.get("ORTHO_DATA_DIR", "data")).resolve()
+
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+_GENERATED_PASSWORD = False
+if not ADMIN_PASSWORD:
+    ADMIN_PASSWORD = secrets.token_urlsafe(12)
+    _GENERATED_PASSWORD = True
 
 
-def _get_loader() -> RasterLoader:
-    if _loader is None or _loader.meta is None:
-        raise HTTPException(status_code=503, detail="No raster file loaded")
-    return _loader
+# ---------------------------------------------------------------------------
+# Multi-file loader cache (LRU over open GDAL datasets)
+# ---------------------------------------------------------------------------
 
+class _LoaderCache:
+    """Keeps up to MAX_OPEN_RASTERS RasterLoaders open, keyed by filename."""
+
+    def __init__(self, maxsize: int):
+        self._max = maxsize
+        self._d: "OrderedDict[str, RasterLoader]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, filename: str) -> RasterLoader:
+        with self._lock:
+            ld = self._d.get(filename)
+            if ld is not None:
+                self._d.move_to_end(filename)
+                return ld
+
+            path = _safe_data_path(filename)
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail=f"No such file: {filename}")
+
+            ld = RasterLoader()
+            try:
+                ld.open(str(path))
+            except Exception as e:
+                raise HTTPException(status_code=422, detail=f"Cannot open raster: {e}")
+
+            self._d[filename] = ld
+            self._d.move_to_end(filename)
+            if len(self._d) > self._max:
+                _, evicted = self._d.popitem(last=False)
+                evicted.close()
+            return ld
+
+    def evict(self, filename: str):
+        with self._lock:
+            ld = self._d.pop(filename, None)
+            if ld is not None:
+                ld.close()
+
+
+_cache = _LoaderCache(MAX_OPEN_RASTERS)
+
+
+def _safe_data_path(filename: str) -> Path:
+    """Resolve filename inside DATA_DIR, rejecting path traversal."""
+    if not filename or os.path.basename(filename) != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = (DATA_DIR / filename).resolve()
+    if DATA_DIR not in path.parents and path != DATA_DIR:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return path
+
+
+def _list_files() -> list[str]:
+    if not DATA_DIR.is_dir():
+        return []
+    return sorted(
+        p.name for p in DATA_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin auth
+# ---------------------------------------------------------------------------
 
 def _build_app() -> "FastAPI":
-    app = FastAPI(title="Ortho Viewer Web", version="1.0")
+    app = FastAPI(title="Ortho Viewer Web", version="2.0")
+    security = HTTPBasic()
+
+    def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
+        user_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
+        pass_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+        if not (user_ok and pass_ok):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid admin credentials",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+        return credentials.username
+
+    # ----------------------------------------------------------------
+    # /  → redirect to admin (nothing sensitive listed publicly here)
+    # ----------------------------------------------------------------
+    @app.get("/")
+    def root():
+        return RedirectResponse(url="/admin")
+
+    # ----------------------------------------------------------------
+    # /admin  — upload form + file list
+    # ----------------------------------------------------------------
+    @app.get("/admin", response_class=HTMLResponse)
+    def admin_page(user: str = Depends(require_admin)):
+        return HTMLResponse(content=_admin_html_page())
+
+    @app.get("/admin/files")
+    def admin_list_files(user: str = Depends(require_admin)):
+        return {"files": [_file_info(f) for f in _list_files()]}
+
+    @app.post("/admin/upload")
+    async def admin_upload(user: str = Depends(require_admin), file: UploadFile = File(...)):
+        name = os.path.basename(file.filename or "")
+        ext = Path(name).suffix.lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(400, f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}")
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        dest = _unique_path(DATA_DIR / name)
+
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(file.file, out)
+
+        # Validate it actually opens as a raster; clean up if not.
+        probe = RasterLoader()
+        try:
+            probe.open(str(dest))
+        except Exception as e:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(422, f"Uploaded file is not a readable raster: {e}")
+        finally:
+            probe.close()
+
+        return _file_info(dest.name)
+
+    @app.delete("/admin/files/{filename}")
+    def admin_delete_file(filename: str, user: str = Depends(require_admin)):
+        path = _safe_data_path(filename)
+        if not path.is_file():
+            raise HTTPException(404, "No such file")
+        _cache.evict(filename)
+        path.unlink()
+        return {"deleted": filename}
 
     # ----------------------------------------------------------------
     # /api/metadata
     # ----------------------------------------------------------------
     @app.get("/api/metadata")
-    def get_metadata():
-        ld = _get_loader()
+    def get_metadata(file: str = Query(...)):
+        ld = _cache.get(file)
         m = ld.meta
-        # Compute zoom levels: z=0 is the full image in one tile, z=max is native
-        # Total tiles at full resolution:
         max_z = max(0, math.ceil(math.log2(
             max(m.width, m.height) / WEB_TILE_SIZE)))
 
-        # Try to get the bounding box in WGS84 for Leaflet
         bbox_geo = None
         try:
             tfm = get_transformer_to_geo(m.crs_wkt)
@@ -125,25 +274,19 @@ def _build_app() -> "FastAPI":
         }
 
     # ----------------------------------------------------------------
-    # /tiles/{z}/{x}/{y}  — image-space TMS tiles
-    #
-    # Coordinate convention (matches the frontend TileLayer):
-    #   z = zoom level (0 = full image in 1 tile, z=n → 2^n × 2^n tiles)
-    #   x, y = tile column / row at that zoom level
+    # /tiles/{file}/{z}/{x}/{y}  — image-space TMS tiles
     # ----------------------------------------------------------------
-    @app.get("/tiles/{z}/{x}/{y}")
-    def get_tile(z: int, x: int, y: int):
-        ld = _get_loader()
+    @app.get("/tiles/{file}/{z}/{x}/{y}")
+    def get_tile(file: str, z: int, x: int, y: int):
+        ld = _cache.get(file)
         m = ld.meta
 
         if z < 0 or z > 32:
             raise HTTPException(400, "Invalid zoom level")
 
-        # Each tile covers (m.width / 2^z) × (m.height / 2^z) native pixels
-        tile_native_w = m.width  / (2 ** z)
+        tile_native_w = m.width / (2 ** z)
         tile_native_h = m.height / (2 ** z)
 
-        # Source region in native image pixels
         x0 = int(round(x * tile_native_w))
         y0 = int(round(y * tile_native_h))
         x1 = int(round((x + 1) * tile_native_w))
@@ -151,25 +294,17 @@ def _build_app() -> "FastAPI":
 
         x0 = max(0, x0)
         y0 = max(0, y0)
-        x1 = min(m.width,  x1)
+        x1 = min(m.width, x1)
         y1 = min(m.height, y1)
 
         if x1 <= x0 or y1 <= y0:
-            # Return a transparent tile
             return Response(content=_transparent_png(), media_type="image/png")
 
         src_w = x1 - x0
         src_h = y1 - y0
-
-        # Output at WEB_TILE_SIZE × WEB_TILE_SIZE
         out_w = WEB_TILE_SIZE
         out_h = WEB_TILE_SIZE
 
-        # Use the raster loader's overview level selection
-        level = RasterLoader.get_overview_level(WEB_TILE_SIZE / max(src_w, src_h))
-        scale = 2 ** level
-
-        # Read via GDAL (simplified: direct tile read at appropriate level)
         arr = _read_region(ld, x0, y0, src_w, src_h, out_w, out_h)
         if arr is None:
             return Response(content=_transparent_png(), media_type="image/png")
@@ -183,7 +318,10 @@ def _build_app() -> "FastAPI":
     # ----------------------------------------------------------------
     @app.post("/api/measure")
     def measure(body: dict):
-        ld = _get_loader()
+        file = body.get("file")
+        if not file:
+            raise HTTPException(400, "Missing 'file'")
+        ld = _cache.get(file)
         from viewer.geo import geodesic_distance_m, geodesic_area_m2
         pts = [(p["x"], p["y"]) for p in body.get("points", [])]
         kind = body.get("kind", "distance")
@@ -197,13 +335,47 @@ def _build_app() -> "FastAPI":
         raise HTTPException(400, "kind must be 'distance' or 'area'")
 
     # ----------------------------------------------------------------
-    # / — Leaflet HTML viewer
+    # /view  — Leaflet HTML viewer for one file (this is what you embed)
     # ----------------------------------------------------------------
-    @app.get("/", response_class=HTMLResponse)
-    def index():
-        return HTMLResponse(content=_html_page())
+    @app.get("/view", response_class=HTMLResponse)
+    def view(file: str = Query(...)):
+        # 404 early if the file doesn't exist, rather than a broken page.
+        _safe_data_path(file)
+        if not (DATA_DIR / file).is_file():
+            raise HTTPException(404, f"No such file: {file}")
+        return HTMLResponse(content=_html_page(file))
 
     return app
+
+
+def _file_info(filename: str) -> dict:
+    path = DATA_DIR / filename
+    return {
+        "filename": filename,
+        "size_bytes": path.stat().st_size if path.is_file() else None,
+        "view_url": f"/view?file={_url_quote(filename)}",
+        "embed_snippet": (
+            f'<iframe src="/view?file={_url_quote(filename)}" '
+            f'style="width:100%;height:600px;border:0;"></iframe>'
+        ),
+    }
+
+
+def _url_quote(s: str) -> str:
+    from urllib.parse import quote
+    return quote(s, safe="")
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    n = 1
+    while True:
+        candidate = path.with_name(f"{stem}-{n}{suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +385,6 @@ def _build_app() -> "FastAPI":
 def _read_region(ld: RasterLoader, x0: int, y0: int, src_w: int, src_h: int,
                  out_w: int, out_h: int) -> Optional[np.ndarray]:
     """Read a region from the open GDAL dataset and return uint8 (H,W,3)."""
-    # Access the private dataset — acceptable since this module is co-located
     ds = ld._ds  # type: ignore[attr-defined]
     if ds is None:
         return None
@@ -267,7 +438,6 @@ def _array_to_png(arr: np.ndarray) -> bytes:
 
 def _transparent_png() -> bytes:
     """Return a 1×1 transparent PNG."""
-    # Minimal valid 1×1 transparent PNG
     return (
         b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01'
         b'\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89'
@@ -277,10 +447,146 @@ def _transparent_png() -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# HTML page
+# Admin HTML page
 # ---------------------------------------------------------------------------
 
-def _html_page() -> str:
+def _admin_html_page() -> str:
+    return r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Ortho Viewer — Admin</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #16161a; color: #dde; font-family: "Segoe UI", sans-serif;
+         padding: 24px; max-width: 780px; margin: 0 auto; }
+  h1 { font-size: 20px; color: #aad; margin-bottom: 4px; }
+  p.hint { color: #889; font-size: 12px; margin-bottom: 20px; }
+  #drop { border: 2px dashed #445; border-radius: 10px; padding: 28px; text-align: center;
+          color: #889; margin-bottom: 24px; cursor: pointer; transition: .15s; }
+  #drop.drag { border-color: #8ab4f8; background: rgba(58,130,246,.08); color: #ccd; }
+  input[type=file] { display: none; }
+  #status { font-size: 12px; margin-bottom: 16px; min-height: 16px; }
+  #status.err { color: #f66; }
+  #status.ok { color: #6d6; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #2a2a36; }
+  th { color: #889; font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  a { color: #8ab4f8; }
+  code { background: #1e1e26; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+  button.del { background: #3a1e22; color: #f88; border: 1px solid #633; border-radius: 5px;
+               padding: 3px 10px; font-size: 11px; cursor: pointer; }
+  button.del:hover { background: #4a262c; }
+  .embed-box { display: flex; gap: 6px; align-items: center; }
+  .embed-box code { flex: 1; overflow-x: auto; white-space: nowrap; }
+  .copy-btn { background: #2a2a36; color: #dde; border: 1px solid #444; border-radius: 5px;
+              padding: 3px 8px; font-size: 11px; cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>Ortho Viewer — Admin</h1>
+<p class="hint">Upload a GeoTIFF or JP2, then copy its embed link or &lt;iframe&gt; snippet.</p>
+
+<div id="drop">Click or drop a .tif / .tiff / .jp2 file here to upload</div>
+<input type="file" id="fileInput" accept=".tif,.tiff,.jp2"/>
+<div id="status"></div>
+
+<table>
+  <thead><tr><th>File</th><th>Size</th><th>Embed</th><th></th></tr></thead>
+  <tbody id="rows"><tr><td colspan="4">Loading…</td></tr></tbody>
+</table>
+
+<script>
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const status = document.getElementById('status');
+const rows = document.getElementById('rows');
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('drag');
+  if (e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) upload(fileInput.files[0]);
+});
+
+function fmtSize(bytes) {
+  if (bytes == null) return '—';
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0, v = bytes;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(1) + ' ' + units[i];
+}
+
+async function upload(file) {
+  status.className = ''; status.textContent = `Uploading ${file.name}…`;
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch('/admin/upload', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Upload failed');
+    status.className = 'ok'; status.textContent = `Uploaded ${data.filename}`;
+    fileInput.value = '';
+    loadFiles();
+  } catch (err) {
+    status.className = 'err'; status.textContent = 'Error: ' + err.message;
+  }
+}
+
+async function loadFiles() {
+  const res = await fetch('/admin/files');
+  const data = await res.json();
+  if (!data.files.length) {
+    rows.innerHTML = '<tr><td colspan="4">No files uploaded yet.</td></tr>';
+    return;
+  }
+  rows.innerHTML = data.files.map(f => `
+    <tr>
+      <td><a href="${f.view_url}" target="_blank">${f.filename}</a></td>
+      <td>${fmtSize(f.size_bytes)}</td>
+      <td><div class="embed-box"><code>${escapeHtml(f.embed_snippet)}</code>
+        <button class="copy-btn" onclick="copySnippet(this)" data-snippet="${escapeAttr(f.embed_snippet)}">Copy</button></div></td>
+      <td><button class="del" onclick="del('${encodeURIComponent(f.filename)}')">Delete</button></td>
+    </tr>
+  `).join('');
+}
+
+function escapeHtml(s) { return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function escapeAttr(s) { return s.replace(/"/g, '&quot;'); }
+
+function copySnippet(btn) {
+  navigator.clipboard.writeText(btn.dataset.snippet).catch(() => {});
+  btn.textContent = 'Copied!';
+  setTimeout(() => btn.textContent = 'Copy', 1200);
+}
+
+async function del(filename) {
+  if (!confirm('Delete this file?')) return;
+  const res = await fetch('/admin/files/' + filename, { method: 'DELETE' });
+  if (res.ok) loadFiles();
+  else status.textContent = 'Delete failed';
+}
+
+loadFiles();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Viewer HTML page
+# ---------------------------------------------------------------------------
+
+def _html_page(file: str) -> str:
+    import json
+    file_json = json.dumps(file)
     return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -350,6 +656,8 @@ def _html_page() -> str:
 // -----------------------------------------------------------------------
 // Bootstrap
 // -----------------------------------------------------------------------
+const FILE = __FILE_JSON__;
+
 const map = L.map('map', {
   crs: L.CRS.Simple,
   zoomControl: true,
@@ -364,7 +672,8 @@ let meta = null;
 let imageBounds = null;
 
 async function init() {
-  const res = await fetch('/api/metadata');
+  const res = await fetch('/api/metadata?file=' + encodeURIComponent(FILE));
+  if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
   meta = await res.json();
   document.getElementById('status').textContent =
     meta.filename + ' · ' + meta.width + '×' + meta.height + ' px';
@@ -396,10 +705,8 @@ function setupMap(m) {
   // Leaflet Simple: lat = -y_pixel, lng = x_pixel  (north-up = negative y)
   imageBounds = [[-m.height, 0], [0, m.width]];
 
-  // Custom TileLayer for image-space tiles
-  // URL pattern: /tiles/{z}/{x}/{y}
-  // Our tiles use z=0 for full image, z=n for 2^n × 2^n grid
-  const tileLayer = L.tileLayer('/tiles/{z}/{x}/{y}', {
+  // Custom TileLayer for image-space tiles, scoped to this file
+  const tileLayer = L.tileLayer('/tiles/' + encodeURIComponent(FILE) + '/{z}/{x}/{y}', {
     tileSize: 256,
     minZoom: -6,
     maxZoom: m.max_zoom,
@@ -408,16 +715,11 @@ function setupMap(m) {
     bounds: imageBounds,
   });
 
-  // Override getTileUrl to use our image-space z/x/y
   tileLayer.getTileUrl = function(coords) {
-    // Leaflet's internal z starts at 0 but maps to our zoom differently.
-    // At zoom level z (Leaflet), the image spans 2^z tiles in each direction.
-    // Our tile z = Leaflet internal z (at zoom 0, one tile covers the image).
     const z = Math.max(0, coords.z);
     const x = coords.x;
     const y = coords.y;
-    // Flip y for TMS convention if needed — Leaflet Simple uses top-down y
-    return `/tiles/${z}/${x}/${y}`;
+    return `/tiles/${encodeURIComponent(FILE)}/${z}/${x}/${y}`;
   };
 
   tileLayer.addTo(map);
@@ -472,12 +774,10 @@ async function measureLayer(type, coords, layer) {
   if (type === 'polyline') {
     const flat = Array.isArray(coords[0]) ? coords[0] : coords;
     points = flat.map(latlngToPixel);
-    // Request world coords from server by converting pixel → world client-side
-    // (we don't expose the geotransform to JS, so we ask the server)
     const res = await fetch('/api/measure', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ kind: 'distance', points }),
+      body: JSON.stringify({ kind: 'distance', points, file: FILE }),
     });
     const data = await res.json();
     showMeasure(data.label, 'Double-click to stop drawing');
@@ -489,7 +789,7 @@ async function measureLayer(type, coords, layer) {
     const res = await fetch('/api/measure', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ kind: 'area', points }),
+      body: JSON.stringify({ kind: 'area', points, file: FILE }),
     });
     const data = await res.json();
     showMeasure(data.label, 'Double-click to close polygon');
@@ -546,45 +846,50 @@ init().catch(err => {
 </script>
 </body>
 </html>
-"""
+""".replace("__FILE_JSON__", file_json)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def serve(path: Optional[str] = None, host: str = "127.0.0.1", port: int = 8765):
+def serve(seed_path: Optional[str] = None, host: str = "127.0.0.1", port: int = 8765):
     if not _WEB_DEPS_OK:
         print("ERROR: Missing web dependencies.  Install them with:")
-        print("  pip install fastapi uvicorn[standard] pillow")
+        print("  pip install fastapi \"uvicorn[standard]\" pillow python-multipart")
         sys.exit(1)
 
-    global _loader
-    _loader = RasterLoader()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    if path:
-        print(f"Loading raster: {path}")
-        try:
-            _loader.open(path)
-            print(f"  OK — {_loader.meta.width} × {_loader.meta.height} px, "
-                  f"{_loader.meta.bands} band(s)")
-        except Exception as e:
-            print(f"ERROR: Cannot open raster: {e}")
+    if seed_path:
+        src = Path(seed_path)
+        if not src.is_file():
+            print(f"ERROR: File not found: {seed_path}")
             sys.exit(1)
-    else:
-        print("No file specified — open a file via the API after startup.")
-        print("(You can POST to /api/open?path=... once that endpoint is added)")
+        dest = DATA_DIR / src.name
+        if not dest.exists():
+            shutil.copy2(src, dest)
+        print(f"Seeded data dir with: {dest.name}")
 
     app = _build_app()
+
     print(f"\nOrtho Viewer web server running at  http://{host}:{port}")
-    print("Press Ctrl+C to stop.\n")
+    print(f"Admin panel:                        http://{host}:{port}/admin")
+    print(f"Data directory:                      {DATA_DIR}")
+    print(f"Admin user:                           {ADMIN_USER}")
+    if _GENERATED_PASSWORD:
+        print(f"Admin password (auto-generated):      {ADMIN_PASSWORD}")
+        print("  Set ADMIN_PASSWORD to pin this across restarts.")
+    else:
+        print("Admin password:                       (from ADMIN_PASSWORD env var)")
+    print("\nPress Ctrl+C to stop.\n")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Ortho Viewer web server")
-    parser.add_argument("file", nargs="?", help="Raster file to open")
+    parser.add_argument("file", nargs="?", help="Optional raster file to seed the data dir with")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()

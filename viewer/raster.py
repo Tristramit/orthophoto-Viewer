@@ -13,8 +13,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtCore import Qt
 
 try:
     from osgeo import gdal, osr
@@ -22,6 +20,13 @@ try:
     _GDAL_OK = True
 except ImportError:
     _GDAL_OK = False
+
+# PyQt6 is only needed for the desktop app's QPixmap tile cache (get_tile /
+# _array_to_pixmap below). The web server reads raw arrays directly and never
+# touches these, so keep the import optional/lazy to avoid pulling Qt's GUI
+# libraries into a headless server deployment.
+if False:  # pragma: no cover - typing only, PyQt6 imported lazily at call sites
+    from PyQt6.QtGui import QPixmap
 
 
 TILE_SIZE = 512       # native image pixels per tile edge
@@ -360,6 +365,7 @@ class RasterLoader:
 
     @staticmethod
     def _array_to_pixmap(arr: np.ndarray) -> QPixmap:
+        from PyQt6.QtGui import QImage, QPixmap
         h, w = arr.shape[:2]
         arr = np.ascontiguousarray(arr)
         img = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888)
