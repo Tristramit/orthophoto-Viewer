@@ -55,10 +55,14 @@ password-protected admin page, then embed any of them with an `<iframe>`.
 **With Docker:**
 
 ```bash
-# 1. Set a real admin password in docker-compose.yml (ADMIN_PASSWORD), then:
+# 1. Set a real admin password (never committed — .env is gitignored):
+cp .env.example .env
+nano .env   # set ADMIN_PASSWORD
+
+# 2. Build and start:
 docker compose up -d --build
 
-# 2. Open the admin page to upload files and copy embed links:
+# 3. Open the admin page to upload files and copy embed links:
 #    http://your-server:8765/admin
 ```
 

@@ -6,7 +6,7 @@ services:
     volumes:
       - ./data:/data
     environment:
-      ADMIN_USER: admin
-      ADMIN_PASSWORD: change-me   # required — set a real password before deploying
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in a .env file — see .env.example}
       # ORTHO_MAX_OPEN: "4"       # optional: how many rasters to keep open at once
     restart: unless-stopped
