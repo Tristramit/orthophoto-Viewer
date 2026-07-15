@@ -2,11 +2,18 @@ services:
   ortho-viewer:
     build: .
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"   # local-only; public access goes through the Cloudflare Tunnel
     volumes:
       - ./data:/data
     environment:
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in a .env file — see .env.example}
       # ORTHO_MAX_OPEN: "4"       # optional: how many rasters to keep open at once
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN:?Set CLOUDFLARE_TUNNEL_TOKEN in a .env file — see .env.example}
+    depends_on:
+      - ortho-viewer
     restart: unless-stopped

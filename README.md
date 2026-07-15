@@ -52,37 +52,47 @@ Optional flags: `--host 0.0.0.0 --port 8765`
 The web server supports multiple orthophotos at once: upload files through a
 password-protected admin page, then embed any of them with an `<iframe>`.
 
-**With Docker:**
+**With Docker + Cloudflare Tunnel** (recommended — no open inbound ports, HTTPS handled by Cloudflare):
 
-```bash
-# 1. Set a real admin password (never committed — .env is gitignored):
-cp .env.example .env
-nano .env   # set ADMIN_PASSWORD
+1. In the [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/) →
+   **Networks → Tunnels → Create a tunnel** → choose **Docker** as the connector.
+   Copy just the token from the install command it shows you
+   (`cloudflared tunnel run --token <THIS PART>`).
+2. On the same tunnel, add a **Public Hostname**: pick a subdomain on a
+   domain your Cloudflare account manages (e.g. `ortho.yourdomain.com`),
+   service type **HTTP**, URL `http://ortho-viewer:8765` (that's the Docker
+   Compose service name — cloudflared reaches it over the internal network,
+   not the internet).
+3. On the server:
 
-# 2. Build and start:
-docker compose up -d --build
+   ```bash
+   cp .env.example .env
+   nano .env   # set ADMIN_PASSWORD and CLOUDFLARE_TUNNEL_TOKEN
 
-# 3. Open the admin page to upload files and copy embed links:
-#    http://your-server:8765/admin
-```
+   docker compose up -d --build
+   ```
 
-Uploaded rasters persist in `./data` (mounted as a volume). Each file gets
-its own viewer URL, e.g. `http://your-server:8765/view?file=site1.tif`, which
-you can drop straight into an `<iframe>`:
+4. Open `https://ortho.yourdomain.com/admin` to upload files and copy embed
+   links — they'll already be `https://ortho.yourdomain.com/view?file=...`.
+
+The `ortho-viewer` container only publishes to `127.0.0.1:8765` on the host
+(see `docker-compose.yml`), so the tunnel is the only public path in — no
+firewall/port-forwarding changes needed on the server itself.
 
 ```html
-<iframe src="http://your-server:8765/view?file=site1.tif"
+<iframe src="https://ortho.yourdomain.com/view?file=site1.tif"
         style="width:100%;height:600px;border:0;"></iframe>
 ```
 
-If the embedding page is served over HTTPS, put the ortho server behind a
-reverse proxy (Caddy, nginx, Traefik) with TLS — browsers block mixed
-HTTP content in an HTTPS iframe.
+Uploaded rasters persist in `./data` (mounted as a volume).
 
 Admin credentials come from the `ADMIN_USER` / `ADMIN_PASSWORD` environment
-variables. If `ADMIN_PASSWORD` isn't set, a random one is generated and
-printed to the server log on startup — set it explicitly for anything
-long-running.
+variables in `.env`.
+
+**Without a tunnel**, the compose file still works the same way, but you'd
+need to publish port 8765 publicly and put a TLS-terminating reverse proxy
+(Caddy, nginx, Traefik) in front of it if the embedding page is HTTPS —
+browsers block mixed HTTP content in an HTTPS iframe.
 
 **Without Docker**, the same server works directly:
 
