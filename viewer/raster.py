@@ -128,6 +128,9 @@ class RasterLoader:
         self._stretch_min: Optional[np.ndarray] = None  # per-band display min
         self._stretch_max: Optional[np.ndarray] = None  # per-band display max
         self._band_order: list[int] = []               # 1-based GDAL band indices → R,G,B
+        self._warped_ds = None            # lazily-built EPSG:3857 warped VRT (for basemap tiles)
+        self._warp_lock = threading.Lock()
+        self._warp_failed = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -150,6 +153,8 @@ class RasterLoader:
             if self._ds is not None:
                 self._ds = None
             self._cache.clear()
+            self._warped_ds = None
+            self._warp_failed = False
 
             ds = gdal.Open(path, gdal.GA_ReadOnly)
             if ds is None:
@@ -216,8 +221,42 @@ class RasterLoader:
     def close(self):
         with self._lock:
             self._ds = None
+            self._warped_ds = None
             self._cache.clear()
             self._meta = None
+
+    def get_webmercator_ds(self):
+        """Lazily build & cache an EPSG:3857 (Web Mercator) warped VRT of this
+        raster, for basemap-aligned tile serving. Returns None if the raster
+        has no usable CRS or the warp fails (e.g. GDAL built without a driver
+        needed for the reprojection); callers should treat that as "no
+        basemap support" rather than an error."""
+        if self._ds is None or not self._meta or not self._meta.crs_wkt:
+            return None
+        if self._warped_ds is not None:
+            return self._warped_ds
+        if self._warp_failed:
+            return None
+        with self._warp_lock:
+            if self._warped_ds is not None:
+                return self._warped_ds
+            if self._warp_failed:
+                return None
+            try:
+                warped = gdal.Warp(
+                    "", self._ds,
+                    format="VRT",
+                    dstSRS="EPSG:3857",
+                    resampleAlg=gdal.GRA_Bilinear,
+                    dstAlpha=True,
+                )
+            except Exception:
+                warped = None
+            if warped is None:
+                self._warp_failed = True
+                return None
+            self._warped_ds = warped
+            return warped
 
     # ------------------------------------------------------------------
     # Private helpers

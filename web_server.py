@@ -10,13 +10,18 @@ Architecture:
   - FastAPI backend:
       GET  /api/metadata?file=NAME      → raster info (CRS, bbox, levels)
       GET  /tiles/{file}/{z}/{x}/{y}    → PNG tile (TMS-like, image-space coords)
+      GET  /webtiles/{file}/{z}/{x}/{y} → PNG tile (EPSG:3857 XYZ, reprojected on the
+                                           fly) for georeferenced rasters, aligned with
+                                           standard OSM/satellite basemap tiles
       POST /api/measure                 → distance/area measurement
       GET  /view?file=NAME              → HTML page with Leaflet viewer (embeddable)
       GET  /admin                       → upload form + file list (HTTP Basic auth)
       POST /admin/upload                → upload a new raster (HTTP Basic auth)
       DELETE /admin/files/{file}        → remove a raster (HTTP Basic auth)
   - Leaflet frontend:
-      Custom TileLayer that calls /tiles/{file}/{z}/{x}/{y}
+      Georeferenced rasters: real-world EPSG:3857 map, ortho reprojected on
+      the fly (/webtiles) over an OpenStreetMap / Esri satellite basemap.
+      Non-georeferenced rasters: plain image-space viewer (/tiles), no basemap.
       Coordinate display, distance & area measurement (Leaflet.draw)
       Dark theme to match desktop app
 
@@ -80,7 +85,14 @@ logger = logging.getLogger("ortho-web")
 
 WEB_TILE_SIZE = 256   # standard web map tile size
 MAX_OPEN_RASTERS = int(os.environ.get("ORTHO_MAX_OPEN", "4"))  # cached loaders
-ALLOWED_EXTENSIONS = {".tif", ".tiff", ".jp2"}
+ALLOWED_EXTENSIONS = {".tif", ".tiff", ".jp2", ".jpg", ".jpeg"}
+
+WEBMERC_ORIGIN = 20037508.342789244  # half circumference of the Web Mercator sphere, metres
+
+# Sidecar files GDAL auto-detects when they sit next to a raster with the
+# same basename: world files (affine transform) and .prj (CRS definition).
+# Needed for plain formats like .jpg that carry no georeferencing of their own.
+SIDECAR_EXTENSIONS = {".jgw", ".jpw", ".tfw", ".j2w", ".wld", ".prj"}
 
 DATA_DIR = Path(os.environ.get("ORTHO_DATA_DIR", "data")).resolve()
 
@@ -195,27 +207,62 @@ def _build_app() -> "FastAPI":
         return {"files": [_file_info(f) for f in _list_files()]}
 
     @app.post("/admin/upload")
-    async def admin_upload(user: str = Depends(require_admin), file: UploadFile = File(...)):
-        name = os.path.basename(file.filename or "")
-        ext = Path(name).suffix.lower()
-        if ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(400, f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}")
+    async def admin_upload(user: str = Depends(require_admin), files: list[UploadFile] = File(...)):
+        mains, sidecars = [], []
+        for f in files:
+            name = os.path.basename(f.filename or "")
+            ext = Path(name).suffix.lower()
+            if ext in ALLOWED_EXTENSIONS:
+                mains.append((name, f))
+            elif ext in SIDECAR_EXTENSIONS:
+                sidecars.append((ext, f))
+            else:
+                raise HTTPException(
+                    400,
+                    f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)} "
+                    f"(plus sidecar files: {sorted(SIDECAR_EXTENSIONS)})",
+                )
+
+        if len(mains) != 1:
+            raise HTTPException(
+                400,
+                "Upload exactly one raster file (.tif/.jp2/.jpg), "
+                "optionally with its .jgw/.wld/.prj sidecar file(s).",
+            )
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        dest = _unique_path(DATA_DIR / name)
+        main_name, main_upload = mains[0]
+        dest = _unique_path(DATA_DIR / main_name)
+        stem = dest.stem  # shared basename sidecars must match for GDAL to find them
 
-        with open(dest, "wb") as out:
-            shutil.copyfileobj(file.file, out)
-
-        # Validate it actually opens as a raster; clean up if not.
-        probe = RasterLoader()
+        written: list[Path] = []
         try:
-            probe.open(str(dest))
-        except Exception as e:
-            dest.unlink(missing_ok=True)
-            raise HTTPException(422, f"Uploaded file is not a readable raster: {e}")
-        finally:
-            probe.close()
+            with open(dest, "wb") as out:
+                shutil.copyfileobj(main_upload.file, out)
+            written.append(dest)
+
+            for ext, sidecar_upload in sidecars:
+                sidecar_dest = DATA_DIR / f"{stem}{ext}"
+                with open(sidecar_dest, "wb") as out:
+                    shutil.copyfileobj(sidecar_upload.file, out)
+                written.append(sidecar_dest)
+
+            # Validate it actually opens as a raster; clean up everything if not.
+            probe = RasterLoader()
+            try:
+                probe.open(str(dest))
+            except Exception as e:
+                raise HTTPException(422, f"Uploaded file is not a readable raster: {e}")
+            finally:
+                probe.close()
+        except HTTPException:
+            for p in written:
+                p.unlink(missing_ok=True)
+            raise
+        except Exception:
+            for p in written:
+                p.unlink(missing_ok=True)
+            raise
 
         return _file_info(dest.name)
 
@@ -226,6 +273,8 @@ def _build_app() -> "FastAPI":
             raise HTTPException(404, "No such file")
         _cache.evict(filename)
         path.unlink()
+        for ext in SIDECAR_EXTENSIONS:
+            (path.with_suffix(ext)).unlink(missing_ok=True)
         return {"deleted": filename}
 
     # ----------------------------------------------------------------
@@ -257,6 +306,23 @@ def _build_app() -> "FastAPI":
         except Exception:
             pass
 
+        # Basemap support: only possible when the raster is georeferenced.
+        # Reprojecting builds a lazy warped VRT (no pixel data is read), so
+        # this is cheap even for huge rasters — safe to do on every metadata
+        # request.
+        webtiles_max_zoom = None
+        if bbox_geo is not None:
+            try:
+                warped = ld.get_webmercator_ds()
+                if warped is not None:
+                    wgt = warped.GetGeoTransform()
+                    mpp = abs(wgt[1])
+                    if mpp > 0:
+                        webtiles_max_zoom = max(2, min(22, round(
+                            math.log2(156543.03392804097 / mpp))))
+            except Exception:
+                webtiles_max_zoom = None
+
         return {
             "filename": os.path.basename(m.path),
             "width": m.width,
@@ -271,6 +337,8 @@ def _build_app() -> "FastAPI":
             "format": m.format_name,
             "max_zoom": max_z,
             "has_overviews": m.has_overviews,
+            "has_basemap": bbox_geo is not None and webtiles_max_zoom is not None,
+            "webtiles_max_zoom": webtiles_max_zoom,
         }
 
     # ----------------------------------------------------------------
@@ -314,6 +382,28 @@ def _build_app() -> "FastAPI":
                         headers={"Cache-Control": "public, max-age=3600"})
 
     # ----------------------------------------------------------------
+    # /webtiles/{file}/{z}/{x}/{y}  — standard EPSG:3857 XYZ tiles,
+    # reprojected on the fly, for use alongside OSM/satellite basemaps.
+    # ----------------------------------------------------------------
+    @app.get("/webtiles/{file}/{z}/{x}/{y}")
+    def get_webmercator_tile(file: str, z: int, x: int, y: int):
+        ld = _cache.get(file)
+
+        if z < 0 or z > 22:
+            raise HTTPException(400, "Invalid zoom level")
+        n = 2 ** z
+        if not (0 <= x < n and 0 <= y < n):
+            return Response(content=_transparent_png(), media_type="image/png")
+
+        arr = _read_webmercator_tile(ld, z, x, y)
+        if arr is None:
+            return Response(content=_transparent_png(), media_type="image/png")
+
+        png_bytes = _array_to_png(arr)
+        return Response(content=png_bytes, media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+    # ----------------------------------------------------------------
     # /api/measure  — server-side measurement (optional, for precision)
     # ----------------------------------------------------------------
     @app.post("/api/measure")
@@ -325,7 +415,18 @@ def _build_app() -> "FastAPI":
         from viewer.geo import geodesic_distance_m, geodesic_area_m2
         pts = [(p["x"], p["y"]) for p in body.get("points", [])]
         kind = body.get("kind", "distance")
-        crs_wkt = ld.meta.crs_wkt
+        if body.get("geo"):
+            # Points are already lon/lat (map clicks on the geographic
+            # basemap view) — geodesic_distance_m/area treat points as
+            # lon/lat directly whenever the CRS is already geographic.
+            from pyproj import CRS
+            crs_wkt = CRS.from_epsg(4326).to_wkt()
+        else:
+            # Points are image pixel coordinates (map clicks on the
+            # Simple-CRS pixel-space view) — convert to the raster's own
+            # world CRS via the geotransform before computing geodesics.
+            pts = [ld.pixel_to_world(px, py) for px, py in pts]
+            crs_wkt = ld.meta.crs_wkt
         if kind == "distance":
             val = geodesic_distance_m(pts, crs_wkt)
             return {"value": val, "label": fmt_distance(val)}
@@ -416,10 +517,109 @@ def _read_region(ld: RasterLoader, x0: int, y0: int, src_w: int, src_h: int,
     return np.stack(channels[:3], axis=2)
 
 
+def _merc_tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+    """Return (minx, miny, maxx, maxy) in EPSG:3857 metres for standard XYZ tile (z,x,y)."""
+    n = 2 ** z
+    tile_m = (2 * WEBMERC_ORIGIN) / n
+    minx = -WEBMERC_ORIGIN + x * tile_m
+    maxx = -WEBMERC_ORIGIN + (x + 1) * tile_m
+    maxy = WEBMERC_ORIGIN - y * tile_m
+    miny = WEBMERC_ORIGIN - (y + 1) * tile_m
+    return minx, miny, maxx, maxy
+
+
+def _read_webmercator_tile(ld: RasterLoader, z: int, x: int, y: int,
+                           out_size: int = WEB_TILE_SIZE) -> Optional[np.ndarray]:
+    """Read one standard EPSG:3857 XYZ tile from the raster's warped VRT.
+
+    Returns an (out_size, out_size, 4) uint8 RGBA array — alpha is 0 outside
+    the raster's actual (possibly rotated) footprint so the basemap shows
+    through — or None if the tile doesn't intersect the raster at all.
+    """
+    warped = ld.get_webmercator_ds()
+    if warped is None:
+        return None
+
+    wgt = warped.GetGeoTransform()
+    W, H = warped.RasterXSize, warped.RasterYSize
+    if wgt[1] <= 0 or wgt[5] >= 0:
+        return None
+
+    minx, miny, maxx, maxy = _merc_tile_bounds(z, x, y)
+
+    px0 = (minx - wgt[0]) / wgt[1]
+    px1 = (maxx - wgt[0]) / wgt[1]
+    py0 = (maxy - wgt[3]) / wgt[5]
+    py1 = (miny - wgt[3]) / wgt[5]
+
+    sx0 = max(0, int(math.floor(px0)))
+    sx1 = min(W, int(math.ceil(px1)))
+    sy0 = max(0, int(math.floor(py0)))
+    sy1 = min(H, int(math.ceil(py1)))
+    if sx1 <= sx0 or sy1 <= sy0:
+        return None
+
+    scale_x = out_size / (px1 - px0)
+    scale_y = out_size / (py1 - py0)
+    dst_x0 = max(0, int(round((sx0 - px0) * scale_x)))
+    dst_y0 = max(0, int(round((sy0 - py0) * scale_y)))
+    dst_w = min(out_size - dst_x0, max(1, int(round((sx1 - sx0) * scale_x))))
+    dst_h = min(out_size - dst_y0, max(1, int(round((sy1 - sy0) * scale_y))))
+    if dst_w <= 0 or dst_h <= 0:
+        return None
+
+    from osgeo import gdal
+    from viewer.raster import _gdal_dtype_to_numpy
+
+    band_order = ld._band_order  # type: ignore[attr-defined]
+    stretch_min = ld._stretch_min  # type: ignore[attr-defined]
+    stretch_max = ld._stretch_max  # type: ignore[attr-defined]
+    src_w, src_h = sx1 - sx0, sy1 - sy0
+
+    channels = []
+    for idx, bi in enumerate(band_order):
+        band = warped.GetRasterBand(bi)
+        raw = band.ReadRaster(sx0, sy0, src_w, src_h, dst_w, dst_h,
+                              resample_alg=gdal.GRIORA_Bilinear)
+        if raw is None:
+            return None
+        np_dtype = _gdal_dtype_to_numpy(band.DataType)
+        ch = np.frombuffer(raw, dtype=np_dtype).reshape(dst_h, dst_w).astype(np.float32)
+        lo = float(stretch_min[idx]) if stretch_min is not None else 0.0
+        hi = float(stretch_max[idx]) if stretch_max is not None else 255.0
+        denom = hi - lo if hi > lo else 1.0
+        ch8 = np.clip((ch - lo) / denom * 255.0, 0, 255).astype(np.uint8)
+        channels.append(ch8)
+
+    if len(channels) == 1:
+        channels = channels * 3
+    rgb = np.stack(channels[:3], axis=2)
+
+    n_bands = warped.RasterCount
+    if n_bands > max(band_order):
+        alpha_band = warped.GetRasterBand(n_bands)
+        araw = alpha_band.ReadRaster(sx0, sy0, src_w, src_h, dst_w, dst_h,
+                                     resample_alg=gdal.GRIORA_Bilinear)
+        a_dtype = _gdal_dtype_to_numpy(alpha_band.DataType)
+        alpha = np.frombuffer(araw, dtype=a_dtype).reshape(dst_h, dst_w)
+        if alpha.dtype != np.uint8:
+            alpha = np.clip(alpha, 0, 255).astype(np.uint8)
+    else:
+        alpha = np.full((dst_h, dst_w), 255, dtype=np.uint8)
+
+    canvas = np.zeros((out_size, out_size, 4), dtype=np.uint8)
+    canvas[dst_y0:dst_y0 + dst_h, dst_x0:dst_x0 + dst_w, 0:3] = rgb
+    canvas[dst_y0:dst_y0 + dst_h, dst_x0:dst_x0 + dst_w, 3] = alpha
+    return canvas
+
+
 def _array_to_png(arr: np.ndarray) -> bytes:
-    """Convert uint8 (H,W,3) array to PNG bytes."""
+    """Convert a uint8 (H,W,3) RGB or (H,W,4) RGBA array to PNG bytes."""
+    has_alpha = arr.shape[2] == 4
+    mode = "RGBA" if has_alpha else "RGB"
+
     if _PIL_OK:
-        img = PILImage.fromarray(arr, mode="RGB")
+        img = PILImage.fromarray(arr, mode=mode)
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=False)
         return buf.getvalue()
@@ -429,7 +629,8 @@ def _array_to_png(arr: np.ndarray) -> bytes:
     from PyQt6.QtCore import QBuffer, QIODevice
     h, w = arr.shape[:2]
     arr_c = np.ascontiguousarray(arr)
-    img = QImage(arr_c.data, w, h, w * 3, QImage.Format.Format_RGB888)
+    qfmt = QImage.Format.Format_RGBA8888 if has_alpha else QImage.Format.Format_RGB888
+    img = QImage(arr_c.data, w, h, w * (4 if has_alpha else 3), qfmt)
     buf = QBuffer()
     buf.open(QIODevice.OpenModeFlag.WriteOnly)
     img.save(buf, "PNG")
@@ -486,10 +687,11 @@ def _admin_html_page() -> str:
 </head>
 <body>
 <h1>Ortho Viewer — Admin</h1>
-<p class="hint">Upload a GeoTIFF or JP2, then copy its embed link or &lt;iframe&gt; snippet.</p>
+<p class="hint">Upload a GeoTIFF, JP2, or JPEG, then copy its embed link or &lt;iframe&gt; snippet.
+Georeferenced JPEGs need their sidecar file (.jgw/.wld/.prj) selected alongside the image.</p>
 
-<div id="drop">Click or drop a .tif / .tiff / .jp2 file here to upload</div>
-<input type="file" id="fileInput" accept=".tif,.tiff,.jp2"/>
+<div id="drop">Click or drop a .tif / .jp2 / .jpg file here (plus its .jgw/.wld/.prj sidecar, if any)</div>
+<input type="file" id="fileInput" multiple accept=".tif,.tiff,.jp2,.jpg,.jpeg,.jgw,.jpw,.tfw,.j2w,.wld,.prj"/>
 <div id="status"></div>
 
 <table>
@@ -509,10 +711,10 @@ drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
 drop.addEventListener('drop', e => {
   e.preventDefault();
   drop.classList.remove('drag');
-  if (e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+  if (e.dataTransfer.files.length) upload(e.dataTransfer.files);
 });
 fileInput.addEventListener('change', () => {
-  if (fileInput.files.length) upload(fileInput.files[0]);
+  if (fileInput.files.length) upload(fileInput.files);
 });
 
 function fmtSize(bytes) {
@@ -523,10 +725,11 @@ function fmtSize(bytes) {
   return v.toFixed(1) + ' ' + units[i];
 }
 
-async function upload(file) {
-  status.className = ''; status.textContent = `Uploading ${file.name}…`;
+async function upload(fileList) {
+  const names = Array.from(fileList).map(f => f.name).join(', ');
+  status.className = ''; status.textContent = `Uploading ${names}…`;
   const form = new FormData();
-  form.append('file', file);
+  for (const f of fileList) form.append('files', f);
   try {
     const res = await fetch('/admin/upload', { method: 'POST', body: form });
     const data = await res.json();
@@ -636,6 +839,15 @@ def _html_page(file: str) -> str:
   .leaflet-draw-toolbar a:hover { background: #3a3a50 !important; }
   .leaflet-popup-content-wrapper { background: #1e1e2a; color: #dde; border: 1px solid #445; }
   .leaflet-popup-tip { background: #1e1e2a; }
+  .leaflet-control-layers { background: #1e1e26 !important; color: #dde !important;
+    border: 1px solid #444 !important; border-radius: 6px !important; }
+  .leaflet-control-layers-toggle { filter: invert(0.85); }
+  .leaflet-control-layers label { color: #dde !important; font-size: 12px; }
+  .leaflet-control-layers-separator { border-top: 1px solid #444 !important; }
+  .leaflet-control-attribution { background: rgba(22,22,30,.75) !important; color: #778 !important; }
+  .leaflet-control-attribution a { color: #8ab4f8 !important; }
+  #opacity-wrap { display: none; align-items: center; gap: 6px; }
+  #opacity-wrap input[type=range] { width: 90px; accent-color: #8ab4f8; }
 </style>
 </head>
 <body>
@@ -644,6 +856,10 @@ def _html_page(file: str) -> str:
   <h1>Ortho Viewer</h1>
   <button class="tb-btn" id="btn-fit" title="Fit image (F)">⊞ Fit</button>
   <button class="tb-btn" id="btn-clear" title="Clear measurements">🗑 Clear</button>
+  <div id="opacity-wrap">
+    <span style="color:#889;font-size:11px;">Ortho opacity</span>
+    <input type="range" id="opacity-slider" min="0" max="100" value="100"/>
+  </div>
   <span id="status">Loading…</span>
 </div>
 
@@ -658,18 +874,11 @@ def _html_page(file: str) -> str:
 // -----------------------------------------------------------------------
 const FILE = __FILE_JSON__;
 
-const map = L.map('map', {
-  crs: L.CRS.Simple,
-  zoomControl: true,
-  attributionControl: false,
-  minZoom: -6,
-  maxZoom: 10,
-  zoomSnap: 0.25,
-  zoomDelta: 0.5,
-});
-
+let map = null;
 let meta = null;
 let imageBounds = null;
+let geoMode = false;
+let orthoLayer = null;
 
 async function init() {
   const res = await fetch('/api/metadata?file=' + encodeURIComponent(FILE));
@@ -678,7 +887,26 @@ async function init() {
   document.getElementById('status').textContent =
     meta.filename + ' · ' + meta.width + '×' + meta.height + ' px';
   renderMeta(meta);
-  setupMap(meta);
+  geoMode = !!meta.has_basemap;
+
+  map = L.map('map', geoMode ? {
+    zoomControl: true,
+    attributionControl: true,
+    minZoom: 0,
+    maxZoom: 22,
+  } : {
+    crs: L.CRS.Simple,
+    zoomControl: true,
+    attributionControl: false,
+    minZoom: -6,
+    maxZoom: 10,
+    zoomSnap: 0.25,
+    zoomDelta: 0.5,
+  });
+
+  if (geoMode) setupGeoMap(meta); else setupPixelMap(meta);
+  setupMeasure();
+  setupCoordDisplay();
 }
 
 function renderMeta(m) {
@@ -689,6 +917,7 @@ function renderMeta(m) {
     ['CRS', m.crs_name],
     ['Pixel size', m.pixel_size_x.toPrecision(5) + ' × ' + m.pixel_size_y.toPrecision(5)],
     ['Overviews', m.has_overviews ? 'yes' : 'none'],
+    ['Basemap', m.has_basemap ? 'available' : 'unavailable (not georeferenced)'],
   ];
   document.getElementById('meta-rows').innerHTML =
     rows.map(([k,v]) =>
@@ -697,9 +926,53 @@ function renderMeta(m) {
 }
 
 // -----------------------------------------------------------------------
-// Map setup
+// Map setup — georeferenced rasters (real-world EPSG:3857 + basemap)
 // -----------------------------------------------------------------------
-function setupMap(m) {
+function setupGeoMap(m) {
+  const bounds = L.latLngBounds(
+    [m.bbox_geo[0], m.bbox_geo[1]],
+    [m.bbox_geo[2], m.bbox_geo[3]]
+  );
+  imageBounds = bounds;
+
+  const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  });
+  const esri = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 19, attribution: 'Tiles &copy; Esri' }
+  );
+  osm.addTo(map);
+
+  orthoLayer = L.tileLayer('/webtiles/' + encodeURIComponent(FILE) + '/{z}/{x}/{y}', {
+    tileSize: 256,
+    minZoom: 0,
+    maxZoom: 22,
+    maxNativeZoom: m.webtiles_max_zoom || 19,
+    attribution: '',
+    bounds: bounds,
+  }).addTo(map);
+
+  L.control.layers(
+    { 'OpenStreetMap': osm, 'Esri Satellite': esri },
+    { 'Orthophoto': orthoLayer },
+    { position: 'topright', collapsed: true }
+  ).addTo(map);
+
+  const opacityWrap = document.getElementById('opacity-wrap');
+  opacityWrap.style.display = 'flex';
+  document.getElementById('opacity-slider').addEventListener('input', (e) => {
+    orthoLayer.setOpacity(e.target.value / 100);
+  });
+
+  map.fitBounds(bounds);
+}
+
+// -----------------------------------------------------------------------
+// Map setup — non-georeferenced rasters (image-space pixel viewer)
+// -----------------------------------------------------------------------
+function setupPixelMap(m) {
   // Image-space coordinate system: y grows downward (Leaflet Simple CRS)
   // Pixel (0,0) = top-left, (width, height) = bottom-right
   // Leaflet Simple: lat = -y_pixel, lng = x_pixel  (north-up = negative y)
@@ -724,9 +997,6 @@ function setupMap(m) {
 
   tileLayer.addTo(map);
   map.fitBounds(imageBounds);
-
-  setupMeasure(m);
-  setupCoordDisplay();
 }
 
 // -----------------------------------------------------------------------
@@ -734,7 +1004,7 @@ function setupMap(m) {
 // -----------------------------------------------------------------------
 let drawnItems = null;
 
-function setupMeasure(m) {
+function setupMeasure() {
   drawnItems = new L.FeatureGroup();
   map.addLayer(drawnItems);
 
@@ -764,20 +1034,21 @@ function setupMeasure(m) {
   });
 }
 
-// Convert Leaflet Simple latlng (lat=-y, lng=x) → pixel coords
-function latlngToPixel(ll) {
-  return { x: ll.lng, y: -ll.lat };
+// Convert a Leaflet latlng → the coordinate pair the backend expects.
+// Geo mode: real lon/lat. Pixel mode: Simple CRS trick (lat=-y, lng=x).
+function latlngToPoint(ll) {
+  return geoMode ? { x: ll.lng, y: ll.lat } : { x: ll.lng, y: -ll.lat };
 }
 
 async function measureLayer(type, coords, layer) {
   let points = [];
   if (type === 'polyline') {
     const flat = Array.isArray(coords[0]) ? coords[0] : coords;
-    points = flat.map(latlngToPixel);
+    points = flat.map(latlngToPoint);
     const res = await fetch('/api/measure', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ kind: 'distance', points, file: FILE }),
+      body: JSON.stringify({ kind: 'distance', points, file: FILE, geo: geoMode }),
     });
     const data = await res.json();
     showMeasure(data.label, 'Double-click to stop drawing');
@@ -785,11 +1056,11 @@ async function measureLayer(type, coords, layer) {
 
   } else if (type === 'polygon') {
     const ring = Array.isArray(coords[0]) ? coords[0] : coords;
-    points = ring.map(latlngToPixel);
+    points = ring.map(latlngToPoint);
     const res = await fetch('/api/measure', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ kind: 'area', points, file: FILE }),
+      body: JSON.stringify({ kind: 'area', points, file: FILE, geo: geoMode }),
     });
     const data = await res.json();
     showMeasure(data.label, 'Double-click to close polygon');
@@ -817,9 +1088,13 @@ function showMeasure(label, hint) {
 function setupCoordDisplay() {
   const bar = document.getElementById('coord-bar');
   map.on('mousemove', (e) => {
-    const px = e.latlng.lng;
-    const py = -e.latlng.lat;
-    bar.textContent = `Image px  X: ${px.toFixed(1)}  Y: ${py.toFixed(1)}`;
+    if (geoMode) {
+      bar.textContent = `Lat: ${e.latlng.lat.toFixed(6)}°  Lon: ${e.latlng.lng.toFixed(6)}°`;
+    } else {
+      const px = e.latlng.lng;
+      const py = -e.latlng.lat;
+      bar.textContent = `Image px  X: ${px.toFixed(1)}  Y: ${py.toFixed(1)}`;
+    }
   });
 }
 
